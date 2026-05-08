@@ -1,13 +1,13 @@
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter, ImageEnhance
 import os
 import urllib.request
 
 # ==========================================
 # INSTALL REQUIRED LIBRARIES
 # ==========================================
-# pip install pillow pillow-heif opencv-python numpy
+# pip install pillow pillow-heif opencv-python numpy opencv-contrib-python
 
 # ==========================================
 # FOLDERS
@@ -18,6 +18,16 @@ OUTPUT_FOLDER = r"C:\Drashtiiii\python\images\imageinput_cropped"
 FINAL_SIZE = (400, 400)
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# ==========================================
+# UPSCALE SETTINGS
+# ==========================================
+# Set to True to enable AI-based upscaling (requires opencv-contrib-python)
+# Set to False to use high-quality Lanczos + sharpening fallback (always works)
+USE_AI_UPSCALE = False   # Change to True if you have opencv-contrib-python installed
+
+UPSCALE_FACTOR = 2       # How much to upscale before resizing to 400x400
+                         # 2 = 2x upscale, 4 = 4x upscale
 
 # ==========================================
 # CONVERT HEIC TO JPG
@@ -72,6 +82,39 @@ if not os.path.exists(MODEL_PATH):
     urllib.request.urlretrieve(url, MODEL_PATH)
 
     print("✅ Model downloaded")
+
+# ==========================================
+# LOAD AI UPSCALER (optional)
+# ==========================================
+sr_model = None
+
+if USE_AI_UPSCALE:
+    try:
+        from cv2 import dnn_superres
+        sr_model = dnn_superres.DnnSuperResImpl_create()
+
+        # Download EDSR model if not present
+        # Models: EDSR_x2, EDSR_x3, EDSR_x4, ESPCN_x2, FSRCNN_x2, LapSRN_x2
+        sr_model_name = f"EDSR_x{UPSCALE_FACTOR}"
+        sr_model_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            f"{sr_model_name}.pb"
+        )
+
+        if not os.path.exists(sr_model_path):
+            print(f"⬇️ Downloading SR model ({sr_model_name})...")
+            sr_url = f"https://github.com/Saafke/EDSR_Tensorflow/raw/master/models/{sr_model_name}.pb"
+            urllib.request.urlretrieve(sr_url, sr_model_path)
+            print("✅ SR model downloaded")
+
+        sr_model.readModel(sr_model_path)
+        sr_model.setModel("edsr", UPSCALE_FACTOR)
+        print(f"✅ AI upscaler loaded: {sr_model_name}")
+
+    except Exception as e:
+        print(f"⚠️ AI upscaler not available: {e}")
+        print("   Falling back to Lanczos + sharpening")
+        sr_model = None
 
 # ==========================================
 # LOAD FACE DETECTOR
@@ -199,10 +242,61 @@ def crop_portrait(img, x, y, w, h):
     return crop
 
 # ==========================================
-# NO UPSCALE
+# UPSCALE IMAGE (NEW)
+# ==========================================
+def upscale_image(img_bgr):
+    """
+    Upscale a blurry/small image to improve quality before final resize.
+
+    Two modes:
+      1. AI upscaling (USE_AI_UPSCALE=True) — uses EDSR neural network
+      2. Lanczos + sharpening (USE_AI_UPSCALE=False) — always available,
+         no extra download needed, still much better than plain resize
+    """
+
+    H, W = img_bgr.shape[:2]
+
+    # --- MODE 1: AI upscaling ---
+    if USE_AI_UPSCALE and sr_model is not None:
+        try:
+            upscaled = sr_model.upsample(img_bgr)
+            print(f"   🔬 AI upscale: {W}x{H} -> {upscaled.shape[1]}x{upscaled.shape[0]}")
+            return upscaled
+        except Exception as e:
+            print(f"   ⚠️ AI upscale failed: {e}, using fallback")
+
+    # --- MODE 2: Lanczos resize + Unsharp Mask sharpening ---
+    # Step 1: Upscale with high-quality Lanczos interpolation
+    new_W = W * UPSCALE_FACTOR
+    new_H = H * UPSCALE_FACTOR
+
+    pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    pil_up = pil.resize((new_W, new_H), Image.LANCZOS)
+
+    # Step 2: Unsharp Mask — brings back edge detail lost in blur
+    # radius=2: how wide the sharpening halo is
+    # percent=150: sharpening strength (100=subtle, 200=strong)
+    # threshold=3: ignore tiny noise differences
+    pil_sharp = pil_up.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+
+    # Step 3: Slight contrast boost to make details pop
+    enhancer = ImageEnhance.Contrast(pil_sharp)
+    pil_final = enhancer.enhance(1.1)
+
+    result = cv2.cvtColor(np.array(pil_final), cv2.COLOR_RGB2BGR)
+    print(f"   ✨ Upscaled: {W}x{H} -> {new_W}x{new_H} (Lanczos + Unsharp Mask)")
+
+    return result
+
+# ==========================================
+# ENHANCE IMAGE  (kept + now calls upscaler)
 # ==========================================
 def enhance_image(img):
-
+    """
+    Previously a no-op. Now applies upscaling for blurry images.
+    All original behavior preserved — upscaling happens before final resize.
+    """
+    img = upscale_image(img)
     return img
 
 # ==========================================
@@ -286,7 +380,7 @@ for filename in sorted(os.listdir(INPUT_FOLDER)):
         status = "FALLBACK"
 
     # ======================================
-    # NO UPSCALE
+    # UPSCALE (was: no-op, now: active)
     # ======================================
     cropped = enhance_image(cropped)
 
