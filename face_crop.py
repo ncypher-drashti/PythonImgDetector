@@ -9,24 +9,38 @@ import urllib.request
 # ==========================================
 INPUT_FOLDER  = r"C:\Drashtiiii\python\images\imageinput"
 OUTPUT_FOLDER = r"C:\Drashtiiii\python\images\imageinput_cropped"
-FINAL_SIZE = (800, 800)
+FINAL_SIZE    = (400, 400)  # Changed to 400x400 as requested
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # ==========================================
-# FACE DETECTOR LOAD
+# MODEL DOWNLOADS
 # ==========================================
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_detection_yunet_2023mar.onnx")
-if not os.path.exists(MODEL_PATH):
-    print("⬇️ Downloading YuNet model...")
-    url = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
-    urllib.request.urlretrieve(url, MODEL_PATH)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FACE_MODEL_PATH = os.path.join(BASE_DIR, "face_detection_yunet_2023mar.onnx")
+UPSCALE_MODEL_PATH = os.path.join(BASE_DIR, "ESPCN_x3.pb") 
 
-detector = cv2.FaceDetectorYN_create(MODEL_PATH, "", (320, 320), score_threshold=0.6)
-print("✅ Face detector loaded.")
+def download_file(url, path, name):
+    if not os.path.exists(path):
+        print(f"⬇️ Downloading {name}...")
+        opener = urllib.request.build_opener()
+        opener.addheaders = [('User-agent', 'Mozilla/5.0')]
+        urllib.request.install_opener(opener)
+        urllib.request.urlretrieve(url, path)
+
+download_file("https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx", FACE_MODEL_PATH, "Face Detector")
+download_file("https://github.com/fannymonori/TF-ESPCN/raw/master/export/ESPCN_x3.pb", UPSCALE_MODEL_PATH, "AI Model")
+
+# Initialize AI Models
+detector = cv2.FaceDetectorYN_create(FACE_MODEL_PATH, "", (320, 320), score_threshold=0.6)
+sr = cv2.dnn_superres.DnnSuperResImpl_create()
+sr.readModel(UPSCALE_MODEL_PATH)
+sr.setModel("espcn", 3) 
+
+print("✅ Systems ready at 400x400 resolution.")
 
 # ==========================================
-# CORE FUNCTIONS
+# CORE FUNCTIONS (FULL ORIGINAL LOGIC)
 # ==========================================
 
 def load_and_fix_rotation(path):
@@ -38,8 +52,8 @@ def load_and_fix_rotation(path):
         print(f"❌ Error loading {path}: {e}")
         return None
 
-
 def detect_face_with_rotation(pil_img):
+    """Keeps your original rotation, landmark logic, and 1-face limit"""
     for angle in [0, 90, 180, 270]:
         rotated = pil_img.rotate(-angle, expand=True) if angle != 0 else pil_img
 
@@ -53,6 +67,7 @@ def detect_face_with_rotation(pil_img):
 
         valid_faces = [f for f in faces if f[14] >= 0.7]
 
+        # Skip if more than 1 face is found
         if len(valid_faces) > 1:
             return rotated, "SKIP", angle
 
@@ -60,6 +75,7 @@ def detect_face_with_rotation(pil_img):
             f = valid_faces[0]
             face_box = (int(f[0]), int(f[1]), int(f[2]), int(f[3]))
 
+            # Landmark validation logic
             left_eye  = np.array([f[4],  f[5]])
             right_eye = np.array([f[6],  f[7]])
             nose      = np.array([f[8],  f[9]])
@@ -69,19 +85,15 @@ def detect_face_with_rotation(pil_img):
             eye_mid   = (left_eye + right_eye) / 2
             mouth_mid = (mouth_l  + mouth_r)   / 2
 
-            eyes_above_nose  = nose[1]      > eye_mid[1]
-            eyes_above_mouth = mouth_mid[1] > eye_mid[1]
-            eyes_horizontal  = right_eye[0] > left_eye[0]
-
-            if eyes_above_nose and eyes_above_mouth and eyes_horizontal:
+            if nose[1] > eye_mid[1] and mouth_mid[1] > eye_mid[1] and right_eye[0] > left_eye[0]:
                 if angle != 0:
-                    print(f"   🔄 Auto-rotated {angle}° to fix orientation")
+                    print(f"   🔄 Auto-rotated {angle}°")
                 return rotated, face_box, angle
 
     return pil_img, None, 0
 
-
 def square_crop_no_stretch(pil_img, face_box):
+    """Original cropping with 0.40 offset"""
     w, h = pil_img.size
 
     if face_box:
@@ -97,63 +109,58 @@ def square_crop_no_stretch(pil_img, face_box):
     right  = left + side
     bottom = top  + side
 
+    # Boundary logic
     if left < 0:
-        left  = 0
-        right = side
+        left, right = 0, side
     if right > w:
-        right = w
-        left  = max(0, w - side)
+        right, left = w, max(0, w - side)
     if top < 0:
-        top    = 0
-        bottom = side
+        top, bottom = 0, side
     if bottom > h:
-        bottom = h
-        top    = max(0, h - side)
+        bottom, top = h, max(0, h - side)
 
     return pil_img.crop((left, top, right, bottom))
 
-
-def enhance_pixels(pil_img):
-    """✅ NO EDSR — INSTANT, SHARP, NO HANGING"""
-    pil_img = pil_img.resize(FINAL_SIZE, Image.Resampling.LANCZOS)
-    pil_img = pil_img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
-    pil_img = ImageEnhance.Contrast(pil_img).enhance(1.1)
-    pil_img = ImageEnhance.Sharpness(pil_img).enhance(1.4)
-    return pil_img
-
+def ai_enhance(pil_img):
+    """AI Upscale + original sharp enhancement style"""
+    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    upscaled = sr.upsample(cv_img)
+    
+    # Final resize to 400x400
+    final_cv = cv2.resize(upscaled, FINAL_SIZE, interpolation=cv2.INTER_LANCZOS4)
+    
+    pil_res = Image.fromarray(cv2.cvtColor(final_cv, cv2.COLOR_BGR2RGB))
+    # Original enhancement values
+    pil_res = pil_res.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
+    pil_res = ImageEnhance.Contrast(pil_res).enhance(1.1)
+    pil_res = ImageEnhance.Sharpness(pil_res).enhance(1.4)
+    
+    return pil_res
 
 # ==========================================
 # MAIN EXECUTION
 # ==========================================
-print("\n🚀 Starting Proper Processing...")
+print("\n🚀 Starting 400x400 AI Processing...")
 
 for filename in sorted(os.listdir(INPUT_FOLDER)):
     if not filename.lower().endswith(('.jpg', '.jpeg', '.png')):
         continue
 
-    print(f"\n📸 Processing: {filename}")
+    print(f"📸 Processing: {filename}")
+    img = load_and_fix_rotation(os.path.join(INPUT_FOLDER, filename))
+    if img is None: continue
 
-    # 1. FIX EXIF ROTATION
-    pil_img = load_and_fix_rotation(os.path.join(INPUT_FOLDER, filename))
-    if pil_img is None:
-        continue
-
-    # 2. DETECT FACE + AUTO-ROTATE IF NEEDED
-    pil_img, face_box, angle = detect_face_with_rotation(pil_img)
+    img, face_box, angle = detect_face_with_rotation(img)
 
     if face_box == "SKIP":
-        print(f"⏭️  SKIPPED {filename}: Multiple faces detected.")
+        print(f"⏭️  SKIPPED: Multiple faces in {filename}")
         continue
 
-    # 3. CROP WITHOUT STRETCHING
-    cropped_pil = square_crop_no_stretch(pil_img, face_box)
+    cropped = square_crop_no_stretch(img, face_box)
+    final = ai_enhance(cropped)
 
-    # 4. ENHANCE + RESIZE — INSTANT, NO AI MODEL
-    final_img = enhance_pixels(cropped_pil)
+    out_name = f"{os.path.splitext(filename)[0]}_400x400.jpg"
+    final.save(os.path.join(OUTPUT_FOLDER, out_name), "JPEG", quality=98)
+    print(f"✅ Saved 400x400 version")
 
-    # 5. SAVE
-    out_name = f"{os.path.splitext(filename)[0]}_fixed.jpg"
-    final_img.save(os.path.join(OUTPUT_FOLDER, out_name), "JPEG", quality=98)
-    print(f"✅ DONE: {filename}" + (f" (rotated {angle}°)" if angle else ""))
-
-print(f"\n✨ Process Finished! Check your folder: {OUTPUT_FOLDER}")
+print(f"\n✨ Done! Files saved in: {OUTPUT_FOLDER}")
