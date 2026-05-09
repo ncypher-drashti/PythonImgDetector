@@ -1,7 +1,6 @@
 import cv2
-import cv2.dnn_superres
 import numpy as np
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 import os
 import urllib.request
 
@@ -10,7 +9,7 @@ import urllib.request
 # ==========================================
 INPUT_FOLDER  = r"C:\Drashtiiii\python\images\imageinput"
 OUTPUT_FOLDER = r"C:\Drashtiiii\python\images\imageinput_cropped"
-FINAL_SIZE = (400, 400)
+FINAL_SIZE = (800, 800)
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -24,27 +23,13 @@ if not os.path.exists(MODEL_PATH):
     urllib.request.urlretrieve(url, MODEL_PATH)
 
 detector = cv2.FaceDetectorYN_create(MODEL_PATH, "", (320, 320), score_threshold=0.6)
-
-# ==========================================
-# SUPER RESOLUTION MODEL LOAD
-# ==========================================
-SR_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "EDSR_x2.pb")
-if not os.path.exists(SR_MODEL_PATH):
-    print("⬇️ Downloading EDSR super-resolution model...")
-    url = "https://github.com/Saafke/EDSR_Tensorflow/raw/master/models/EDSR_x2.pb"
-    urllib.request.urlretrieve(url, SR_MODEL_PATH)
-
-sr = cv2.dnn_superres.DnnSuperResImpl_create()
-sr.readModel(SR_MODEL_PATH)
-sr.setModel("edsr", 2)  # 2x upscale
-print("✅ Super-resolution model loaded.")
+print("✅ Face detector loaded.")
 
 # ==========================================
 # CORE FUNCTIONS
 # ==========================================
 
 def load_and_fix_rotation(path):
-    """SADHI RITE PHOTO LOAD KARE CHE (EXIF ROTATION FIX)"""
     try:
         pil_img = Image.open(path)
         pil_img = ImageOps.exif_transpose(pil_img)
@@ -55,11 +40,6 @@ def load_and_fix_rotation(path):
 
 
 def detect_face_with_rotation(pil_img):
-    """
-    FACE DETECT KARE CHE — JYARE NAHI MALE, TYARE IMAGE NE ROTATE KARI
-    PRAYAS KARE CHE (0°, 90°, 180°, 270°).
-    RETURNS: (rotated_pil_img, face_box, angle_used) OR ("SKIP", ...) OR (None, ...)
-    """
     for angle in [0, 90, 180, 270]:
         rotated = pil_img.rotate(-angle, expand=True) if angle != 0 else pil_img
 
@@ -80,8 +60,6 @@ def detect_face_with_rotation(pil_img):
             f = valid_faces[0]
             face_box = (int(f[0]), int(f[1]), int(f[2]), int(f[3]))
 
-            # LANDMARK-BASED UPRIGHT CHECK
-            # YuNet 5 landmarks: left_eye, right_eye, nose, mouth_left, mouth_right
             left_eye  = np.array([f[4],  f[5]])
             right_eye = np.array([f[6],  f[7]])
             nose      = np.array([f[8],  f[9]])
@@ -91,11 +69,8 @@ def detect_face_with_rotation(pil_img):
             eye_mid   = (left_eye + right_eye) / 2
             mouth_mid = (mouth_l  + mouth_r)   / 2
 
-            # UPRIGHT FACE: nose & mouth must be BELOW eyes (larger y in image coords)
             eyes_above_nose  = nose[1]      > eye_mid[1]
             eyes_above_mouth = mouth_mid[1] > eye_mid[1]
-
-            # EYES HORIZONTAL: left_eye should be LEFT of right_eye
             eyes_horizontal  = right_eye[0] > left_eye[0]
 
             if eyes_above_nose and eyes_above_mouth and eyes_horizontal:
@@ -107,29 +82,44 @@ def detect_face_with_rotation(pil_img):
 
 
 def square_crop_no_stretch(pil_img, face_box):
-    """CROP KARE CHE PAN STRETCH THAVA NAHI DE"""
     w, h = pil_img.size
+
     if face_box:
         fx, fy, fw, fh = face_box
         cx, cy = fx + fw // 2, fy + fh // 2
-        side = int(fh * 4.0)
+        side = int(fh * 3.0)
     else:
         cx, cy = w // 2, h // 2
         side = min(w, h)
 
-    left   = max(0, cx - side // 2)
-    top    = max(0, cy - int(side * 0.45))
-    right  = min(w, left + side)
-    bottom = min(h, top + side)
+    left   = cx - side // 2
+    top    = cy - int(side * 0.40)
+    right  = left + side
+    bottom = top  + side
+
+    if left < 0:
+        left  = 0
+        right = side
+    if right > w:
+        right = w
+        left  = max(0, w - side)
+    if top < 0:
+        top    = 0
+        bottom = side
+    if bottom > h:
+        bottom = h
+        top    = max(0, h - side)
 
     return pil_img.crop((left, top, right, bottom))
 
 
 def enhance_pixels(pil_img):
-    """SUPER RESOLUTION VADE UPSCALE KARE CHE (NO BLUR)"""
-    cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-    upscaled = sr.upsample(cv_img)
-    return Image.fromarray(cv2.cvtColor(upscaled, cv2.COLOR_BGR2RGB))
+    """✅ NO EDSR — INSTANT, SHARP, NO HANGING"""
+    pil_img = pil_img.resize(FINAL_SIZE, Image.Resampling.LANCZOS)
+    pil_img = pil_img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
+    pil_img = ImageEnhance.Contrast(pil_img).enhance(1.1)
+    pil_img = ImageEnhance.Sharpness(pil_img).enhance(1.4)
+    return pil_img
 
 
 # ==========================================
@@ -158,13 +148,10 @@ for filename in sorted(os.listdir(INPUT_FOLDER)):
     # 3. CROP WITHOUT STRETCHING
     cropped_pil = square_crop_no_stretch(pil_img, face_box)
 
-    # 4. SUPER RESOLUTION UPSCALE FIRST (AI-based, no blur)
-    enhanced_img = enhance_pixels(cropped_pil)
+    # 4. ENHANCE + RESIZE — INSTANT, NO AI MODEL
+    final_img = enhance_pixels(cropped_pil)
 
-    # 5. RESIZE TO FINAL SIZE
-    final_img = enhanced_img.resize(FINAL_SIZE, Image.Resampling.LANCZOS)
-
-    # 6. SAVE
+    # 5. SAVE
     out_name = f"{os.path.splitext(filename)[0]}_fixed.jpg"
     final_img.save(os.path.join(OUTPUT_FOLDER, out_name), "JPEG", quality=98)
     print(f"✅ DONE: {filename}" + (f" (rotated {angle}°)" if angle else ""))
