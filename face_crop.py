@@ -7,12 +7,13 @@ import urllib.request
 # ==========================================
 # SETTINGS
 # ==========================================
-INPUT_FOLDER  = r"C:\Drashtiiii\python\images\imageinput"
+INPUT_FOLDER = r"C:\Drashtiiii\python\images\imageinput"
 OUTPUT_FOLDER = r"C:\Drashtiiii\python\images\imageinput_cropped"
 
 FINAL_SIZE = (400, 400)
 
-BLUR_THRESHOLD = 85
+# Blur strictness
+SHARP_VOTE_THRESHOLD = 3
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -36,9 +37,7 @@ def download_file(url, path, name):
         print(f"⬇️ Downloading {name}...")
 
         opener = urllib.request.build_opener()
-
         opener.addheaders = [('User-agent', 'Mozilla/5.0')]
-
         urllib.request.install_opener(opener)
 
         urllib.request.urlretrieve(url, path)
@@ -62,18 +61,18 @@ detector = cv2.FaceDetectorYN_create(
 print("✅ System Ready")
 
 # ==========================================
-# LOAD IMAGE + FIX ROTATION
+# LOAD IMAGE
 # ==========================================
-def load_and_fix_rotation(path):
+def load_image(path):
 
     try:
 
-        pil_img = Image.open(path)
+        img = Image.open(path)
 
-        # Auto-fix mobile photo rotation
-        pil_img = ImageOps.exif_transpose(pil_img)
+        # Fix mobile EXIF rotation
+        img = ImageOps.exif_transpose(img)
 
-        return pil_img.convert("RGB")
+        return img.convert("RGB")
 
     except Exception as e:
 
@@ -82,178 +81,314 @@ def load_and_fix_rotation(path):
         return None
 
 # ==========================================
-# BLUR CHECK
+# DETECT FACES
 # ==========================================
-def is_blurry(pil_img):
+def detect_faces(pil_img):
+
+    cv_img = cv2.cvtColor(
+        np.array(pil_img),
+        cv2.COLOR_RGB2BGR
+    )
+
+    h, w = cv_img.shape[:2]
+
+    detector.setInputSize((w, h))
+
+    _, faces = detector.detect(cv_img)
+
+    if faces is None:
+        return []
+
+    return [f for f in faces if f[14] >= 0.7]
+
+# ==========================================
+# FIX UPSIDE DOWN ONLY
+# ==========================================
+def fix_upside_down(pil_img):
+
+    # ---------- NORMAL ----------
+    faces_0 = detect_faces(pil_img)
+
+    valid_0 = []
+
+    for f in faces_0:
+
+        left_eye = np.array([f[4], f[5]])
+        right_eye = np.array([f[6], f[7]])
+        nose = np.array([f[8], f[9]])
+        mouth_l = np.array([f[10], f[11]])
+        mouth_r = np.array([f[12], f[13]])
+
+        eye_mid = (left_eye + right_eye) / 2
+        mouth_mid = (mouth_l + mouth_r) / 2
+
+        if (
+            nose[1] > eye_mid[1]
+            and mouth_mid[1] > eye_mid[1]
+            and right_eye[0] > left_eye[0]
+        ):
+            valid_0.append(f)
+
+    # MULTIPLE FACES
+    if len(valid_0) > 1:
+        return pil_img, "SKIP"
+
+    # SINGLE FACE
+    if len(valid_0) == 1:
+
+        f = valid_0[0]
+
+        face_box = (
+            int(f[0]),
+            int(f[1]),
+            int(f[2]),
+            int(f[3])
+        )
+
+        return pil_img, face_box
+
+    # ---------- UPSIDE DOWN ----------
+    rotated = pil_img.rotate(
+        -180,
+        expand=True
+    )
+
+    faces_180 = detect_faces(rotated)
+
+    valid_180 = []
+
+    for f in faces_180:
+
+        left_eye = np.array([f[4], f[5]])
+        right_eye = np.array([f[6], f[7]])
+        nose = np.array([f[8], f[9]])
+        mouth_l = np.array([f[10], f[11]])
+        mouth_r = np.array([f[12], f[13]])
+
+        eye_mid = (left_eye + right_eye) / 2
+        mouth_mid = (mouth_l + mouth_r) / 2
+
+        if (
+            nose[1] > eye_mid[1]
+            and mouth_mid[1] > eye_mid[1]
+            and right_eye[0] > left_eye[0]
+        ):
+            valid_180.append(f)
+
+    # MULTIPLE FACES
+    if len(valid_180) > 1:
+        return rotated, "SKIP"
+
+    # SINGLE FACE
+    if len(valid_180) == 1:
+
+        print("🔄 Upside down image fixed")
+
+        f = valid_180[0]
+
+        face_box = (
+            int(f[0]),
+            int(f[1]),
+            int(f[2]),
+            int(f[3])
+        )
+
+        return rotated, face_box
+
+    return pil_img, None
+
+# ==========================================
+# FACE BLUR CHECK
+# ONLY FACE IS CHECKED
+# ==========================================
+def is_face_blurry(pil_img, face_box):
+
+    fx, fy, fw, fh = face_box
+
+    pad = int(fh * 0.2)
+
+    x1 = max(0, fx - pad)
+    y1 = max(0, fy - pad)
+    x2 = min(pil_img.width, fx + fw + pad)
+    y2 = min(pil_img.height, fy + fh + pad)
+
+    face = pil_img.crop((x1, y1, x2, y2))
+
+    face = face.resize(
+        (300, 300),
+        Image.Resampling.LANCZOS
+    )
 
     gray = cv2.cvtColor(
-        np.array(pil_img),
+        np.array(face),
         cv2.COLOR_RGB2GRAY
     )
 
-    blur_score = cv2.Laplacian(
+    # Method 1
+    lap = cv2.Laplacian(
         gray,
         cv2.CV_64F
     ).var()
 
-    print(f"   🔍 Blur Score: {blur_score:.2f}")
+    # Method 2
+    sobelx = cv2.Sobel(
+        gray,
+        cv2.CV_64F,
+        1,
+        0,
+        ksize=3
+    )
 
-    return blur_score < BLUR_THRESHOLD
+    sobely = cv2.Sobel(
+        gray,
+        cv2.CV_64F,
+        0,
+        1,
+        ksize=3
+    )
+
+    sobel = np.sqrt(
+        sobelx**2 + sobely**2
+    ).mean()
+
+    # Method 3
+    tenengrad = (
+        sobelx**2 + sobely**2
+    ).mean()
+
+    # Method 4
+    brenner = np.sum(
+        (
+            gray[:-2, :].astype(float)
+            - gray[2:, :].astype(float)
+        ) ** 2
+    ) / gray.size
+
+    votes = sum([
+        lap > 80,
+        sobel > 8,
+        tenengrad > 100,
+        brenner > 50
+    ])
+
+    blurry = votes < SHARP_VOTE_THRESHOLD
+
+    print(
+        f"🔍 Face Quality → "
+        f"Votes:{votes}/4 "
+        f"{'⚠️ BLURRY' if blurry else '✅ SHARP'}"
+    )
+
+    return blurry
 
 # ==========================================
-# FACE DETECTION WITH ROTATION
+# UPSCALE IMAGE
 # ==========================================
-def detect_face_with_rotation(pil_img):
+def upscale_image(pil_img):
 
-    for angle in [0, 90, 180, 270]:
+    img = cv2.cvtColor(
+        np.array(pil_img),
+        cv2.COLOR_RGB2BGR
+    )
 
-        rotated = (
-            pil_img.rotate(-angle, expand=True)
-            if angle != 0
-            else pil_img
+    upscaled = cv2.resize(
+        img,
+        None,
+        fx=2,
+        fy=2,
+        interpolation=cv2.INTER_CUBIC
+    )
+
+    # Sharpen
+    kernel = np.array([
+        [0, -1, 0],
+        [-1, 5, -1],
+        [0, -1, 0]
+    ])
+
+    sharpened = cv2.filter2D(
+        upscaled,
+        -1,
+        kernel
+    )
+
+    return Image.fromarray(
+        cv2.cvtColor(
+            sharpened,
+            cv2.COLOR_BGR2RGB
         )
-
-        cv_img = cv2.cvtColor(
-            np.array(rotated),
-            cv2.COLOR_RGB2BGR
-        )
-
-        h, w = cv_img.shape[:2]
-
-        detector.setInputSize((w, h))
-
-        _, faces = detector.detect(cv_img)
-
-        if faces is None:
-            continue
-
-        valid_faces = [
-            f for f in faces if f[14] >= 0.7
-        ]
-
-        # ==================================
-        # MULTIPLE FACE → SKIP
-        # ==================================
-        if len(valid_faces) > 1:
-
-            return rotated, "SKIP", angle
-
-        # ==================================
-        # SINGLE FACE
-        # ==================================
-        if len(valid_faces) == 1:
-
-            f = valid_faces[0]
-
-            face_box = (
-                int(f[0]),
-                int(f[1]),
-                int(f[2]),
-                int(f[3])
-            )
-
-            # Landmark validation
-            left_eye  = np.array([f[4],  f[5]])
-            right_eye = np.array([f[6],  f[7]])
-            nose      = np.array([f[8],  f[9]])
-            mouth_l   = np.array([f[10], f[11]])
-            mouth_r   = np.array([f[12], f[13]])
-
-            eye_mid   = (left_eye + right_eye) / 2
-            mouth_mid = (mouth_l + mouth_r) / 2
-
-            if (
-                nose[1] > eye_mid[1]
-                and mouth_mid[1] > eye_mid[1]
-                and right_eye[0] > left_eye[0]
-            ):
-
-                if angle != 0:
-                    print(f"   🔄 Auto Rotated {angle}°")
-
-                return rotated, face_box, angle
-
-    return pil_img, None, 0
+    )
 
 # ==========================================
-# CROP
+# CROP FACE
 # ==========================================
-def square_crop_no_stretch(pil_img, face_box):
+def crop_face(pil_img, face_box):
 
     w, h = pil_img.size
 
-    # ==================================
-    # FACE CROP
-    # ==================================
-    if face_box:
+    fx, fy, fw, fh = face_box
 
-        fx, fy, fw, fh = face_box
+    cx = fx + fw // 2
+    cy = fy + fh // 2
 
-        cx = fx + fw // 2
-        cy = fy + fh // 2
+    side = int(fh * 3.0)
 
-        side = int(fh * 3.0)
+    left = cx - side // 2
+    top = cy - int(side * 0.40)
 
-    # ==================================
-    # CENTER CROP
-    # ==================================
-    else:
-
-        cx = w // 2
-        cy = h // 2
-
-        side = min(w, h)
-
-    left   = cx - side // 2
-    top    = cy - int(side * 0.40)
-
-    right  = left + side
+    right = left + side
     bottom = top + side
 
-    # Boundary fixes
+    # Boundary fix
     if left < 0:
-
         left = 0
         right = side
 
     if right > w:
-
         right = w
         left = max(0, w - side)
 
     if top < 0:
-
         top = 0
         bottom = side
 
     if bottom > h:
-
         bottom = h
         top = max(0, h - side)
 
-    return pil_img.crop(
-        (left, top, right, bottom)
-    )
+    return pil_img.crop((left, top, right, bottom))
 
 # ==========================================
-# KEEP ORIGINAL QUALITY
+# RESIZE
 # ==========================================
-def keep_original_quality(pil_img):
+def resize_final(img):
 
-    return pil_img.resize(
+    return img.resize(
         FINAL_SIZE,
         Image.Resampling.LANCZOS
     )
 
 # ==========================================
-# MAIN PROCESS
+# CENTER CROP
+# ==========================================
+def center_crop(img):
+
+    return ImageOps.fit(
+        img,
+        FINAL_SIZE,
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.5)
+    )
+
+# ==========================================
+# MAIN
 # ==========================================
 print("\n🚀 Starting Processing...\n")
 
 for filename in sorted(os.listdir(INPUT_FOLDER)):
 
     if not filename.lower().endswith(
-        ('.jpg', '.jpeg', '.png')
+        (".jpg", ".jpeg", ".png")
     ):
         continue
 
@@ -264,60 +399,120 @@ for filename in sorted(os.listdir(INPUT_FOLDER)):
         filename
     )
 
-    img = load_and_fix_rotation(image_path)
+    img = load_image(image_path)
 
     if img is None:
         continue
 
-    # ==================================
-    # BLUR CHECK
-    # ==================================
-    if is_blurry(img):
+    # ======================================
+    # FIX UPSIDE DOWN
+    # ======================================
+    img, face_box = fix_upside_down(img)
 
-        print("⚠️ Blur image detected")
-
-    # ==================================
-    # FACE DETECTION
-    # ==================================
-    img, face_box, angle = detect_face_with_rotation(img)
-
-    # ==================================
-    # MULTIPLE FACE SKIP
-    # ==================================
+    # ======================================
+    # MULTIPLE FACES
+    # ======================================
     if face_box == "SKIP":
 
-        print("⏭️ Skipped: Multiple Faces")
+        print("⏭️ Multiple faces detected → skipped")
 
         continue
 
-    # ==================================
+    # ======================================
     # NO FACE
-    # ==================================
+    # CENTER CROP
+    # ======================================
     if face_box is None:
 
-        print("➡️ No valid face found")
-        print("➡️ Using center crop")
+        print("➡️ No face found → center crop")
 
-    else:
+        final = center_crop(img)
 
-        print("✅ Face detected")
+        out_name = (
+            f"{os.path.splitext(filename)[0]}_center.jpg"
+        )
 
-    # ==================================
-    # CROP
-    # ==================================
-    cropped = square_crop_no_stretch(
+        out_path = os.path.join(
+            OUTPUT_FOLDER,
+            out_name
+        )
+
+        final.save(
+            out_path,
+            "JPEG",
+            quality=100,
+            subsampling=0
+        )
+
+        print(f"✅ Saved center crop: {out_name}")
+
+        continue
+
+    print("✅ Face detected")
+
+    # ======================================
+    # FACE BLUR CHECK
+    # ======================================
+    blurry = is_face_blurry(
         img,
         face_box
     )
 
-    # ==================================
-    # FINAL RESIZE
-    # ==================================
-    final = keep_original_quality(cropped)
+    # ======================================
+    # BLURRY FACE
+    # SAVE ORIGINAL ONLY
+    # ======================================
+    if blurry:
 
-    # ==================================
+        print("⚠️ Blurry face → crop skipped")
+
+        out_name = (
+            f"{os.path.splitext(filename)[0]}_original.jpg"
+        )
+
+        out_path = os.path.join(
+            OUTPUT_FOLDER,
+            out_name
+        )
+
+        img.save(
+            out_path,
+            "JPEG",
+            quality=100,
+            subsampling=0
+        )
+
+        print(f"📋 Saved original image: {out_name}")
+
+        continue
+
+    # ======================================
+    # SHARP FACE
+    # UPSCALE + CROP
+    # ======================================
+    print("✨ Sharp face → upscale + crop")
+
+    upscaled = upscale_image(img)
+
+    fx, fy, fw, fh = face_box
+
+    new_face_box = (
+        fx * 2,
+        fy * 2,
+        fw * 2,
+        fh * 2
+    )
+
+    cropped = crop_face(
+        upscaled,
+        new_face_box
+    )
+
+    final = resize_final(cropped)
+
+    # ======================================
     # SAVE
-    # ==================================
+    # ======================================
     out_name = (
         f"{os.path.splitext(filename)[0]}_400x400.jpg"
     )
